@@ -134,10 +134,12 @@ function Write-LocalLog {
 
     if ($script:LocalLogFile) {
         try {
+            # BOM 付き UTF-8。BOM はファイル新規作成時のみ書き込まれるため追記は安全。
+            # BOM を付けることで Get-Content / メモ帳 / Excel から文字化けせず読める。
             [System.IO.File]::AppendAllText(
                 $script:LocalLogFile,
                 $line + [Environment]::NewLine,
-                (New-Object System.Text.UTF8Encoding($false)))
+                (New-Object System.Text.UTF8Encoding($true)))
         }
         catch {
             # ローカルログにすら書けない場合は握りつぶして継続 (計測を止めない)
@@ -557,7 +559,7 @@ function Show-Status {
         if ([System.IO.Directory]::Exists($dir)) {
             Write-Host "  ディレクトリ : アクセス可 -> このノードは ACTIVE 想定" -ForegroundColor Green
             if (Test-Path -LiteralPath $TargetPath) {
-                $last = Get-Content -LiteralPath $TargetPath -Tail 5 -ErrorAction SilentlyContinue
+                $last = Get-Content -LiteralPath $TargetPath -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue
                 Write-Host "  --- 直近 5 行 ---"
                 $last | ForEach-Object { Write-Host "  $_" }
             }
@@ -575,7 +577,7 @@ function Show-Status {
             Write-Host ""
             Write-Host "[ローカルログ] $($latest.FullName)"
             Write-Host "  --- 直近の役割遷移 (EVENT) ---"
-            Get-Content -LiteralPath $latest.FullName |
+            Get-Content -LiteralPath $latest.FullName -Encoding UTF8 |
                 Where-Object { $_ -match "`tEVENT`t" } |
                 Select-Object -Last 10 |
                 ForEach-Object { Write-Host "  $_" -ForegroundColor Cyan }
@@ -594,7 +596,7 @@ function Invoke-Analyze {
         throw "出力ファイルが見つかりません (このノードから共有ディスクが見えていない可能性): $TargetPath"
     }
 
-    $rows = @(Import-Csv -LiteralPath $TargetPath | ForEach-Object {
+    $rows = @(Import-Csv -LiteralPath $TargetPath -Encoding UTF8 | ForEach-Object {
             [pscustomobject]@{
                 Utc      = [datetime]::ParseExact($_.TimestampUtc, 'yyyy-MM-ddTHH:mm:ss.fffZ',
                             [cultureinfo]::InvariantCulture,
