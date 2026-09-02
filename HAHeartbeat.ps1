@@ -133,9 +133,9 @@ function Write-LocalLog {
         [ValidateSet('INFO', 'WARN', 'ERROR', 'EVENT')][string]$Level = 'INFO'
     )
 
+    # 表示・記録はローカル時刻で統一する (CSV の TimestampUtc 列のみ UTC を保持)
     $tab  = [char]9
     $line = ((Get-Date).ToString('yyyy-MM-dd HH:mm:ss.fff'),
-             [DateTime]::UtcNow.ToString('yyyy-MM-dd HH:mm:ss.fff'),
              $Level,
              $env:COMPUTERNAME,
              $Message) -join $tab
@@ -307,9 +307,9 @@ function Invoke-RunMode {
                     [System.Globalization.DateTimeStyles]::AssumeUniversal)
                 $fileLastNode = $f[2]
                 Write-LocalLog -Level 'EVENT' -Message (
-                    "PREVIOUS WRITE 出力先の最終書込: node={0} utc={1} (現在との差={2}s)" -f `
+                    "PREVIOUS WRITE 出力先の最終書込: node={0} time={1} (現在との差={2}s)" -f `
                         $fileLastNode,
-                        $fileLastUtc.ToString('yyyy-MM-dd HH:mm:ss.fff'),
+                        $fileLastUtc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff'),
                         [math]::Round(([DateTime]::UtcNow - $fileLastUtc).TotalSeconds, 3))
             }
         }
@@ -624,8 +624,14 @@ function Show-Status {
             Write-Host "  ディレクトリ : アクセス可 -> このノードは ACTIVE 想定" -ForegroundColor Green
             if (Test-Path -LiteralPath $TargetPath) {
                 $last = Get-Content -LiteralPath $TargetPath -Tail 5 -Encoding UTF8 -ErrorAction SilentlyContinue
-                Write-Host "  --- 直近 5 行 ---"
-                $last | ForEach-Object { Write-Host "  $_" }
+                Write-Host "  --- 直近 5 件 (ローカル時刻) ---"
+                foreach ($l in $last) {
+                    $f = $l.Split(',')
+                    if ($f.Count -ge 5 -and $f[0] -ne 'TimestampUtc') {
+                        Write-Host ("  {0}  node={1}  seq={2}  pid={3}" -f `
+                            ($f[1] -replace 'T', ' '), $f[2], $f[3], $f[4])
+                    }
+                }
             }
         }
         else {
@@ -740,7 +746,7 @@ function Invoke-Analyze {
     Write-Host "===== ハートビート解析 =====" -ForegroundColor Cyan
     Write-Host "対象ファイル : $TargetPath"
     Write-Host "レコード数   : $($rows.Count)"
-    Write-Host "期間 (UTC)   : $($rows[0].Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')) - $($rows[-1].Utc.ToString('yyyy-MM-dd HH:mm:ss.fff'))"
+    Write-Host "期間 (ローカル): $($rows[0].Utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')) - $($rows[-1].Utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff'))"
     Write-Host "書込間隔     : ${IntervalSeconds} 秒 / 断絶判定閾値: ${threshold} 秒"
     Write-Host ""
 
@@ -763,9 +769,9 @@ function Invoke-Analyze {
 
             $null = $events.Add([pscustomobject]@{
                     Type     = $kind
-                    LastUtc  = $prev.Utc.ToString('MM-dd HH:mm:ss.fff')
+                    LastTime = $prev.Utc.ToLocalTime().ToString('MM-dd HH:mm:ss.fff')
                     LastNode = $prev.Node
-                    NextUtc  = $cur.Utc.ToString('MM-dd HH:mm:ss.fff')
+                    NextTime = $cur.Utc.ToLocalTime().ToString('MM-dd HH:mm:ss.fff')
                     NextNode = $cur.Node
                     Gap      = [math]::Round($gap, 3)
                     Lost     = [math]::Max(0, [int][math]::Round($gap / $IntervalSeconds) - 1)
@@ -782,13 +788,13 @@ function Invoke-Analyze {
 
         if ($realtime.Count -gt 0) {
             Write-Host "--- 検出イベント (稼働中の断絶) ---" -ForegroundColor Yellow
-            $realtime | Format-Table Type, LastUtc, LastNode, NextUtc, NextNode, Gap, Lost `
+            $realtime | Format-Table Type, LastTime, LastNode, NextTime, NextNode, Gap, Lost `
                 -AutoSize | Out-String -Width 500 | Write-Host
         }
 
         if ($outages.Count -gt 0) {
             Write-Host ("--- 停止期間 ({0} 秒超: サマリ対象外) ---" -f $OutageThresholdSeconds) -ForegroundColor DarkGray
-            $outages | Select-Object Type, LastUtc, NextUtc,
+            $outages | Select-Object Type, LastTime, NextTime,
                 @{n = 'Gap'; e = { '{0:N1}s ({1:N1}h)' -f $_.Gap, ($_.Gap / 3600) } } |
                 Format-Table -AutoSize | Out-String -Width 500 | Write-Host
         }
@@ -826,8 +832,8 @@ function Invoke-Analyze {
         if ($rows[$i].Node -ne $rows[$i - 1].Node) {
             $null = $segments.Add([pscustomobject]@{
                     Node          = $segStart.Node
-                    FromUtc       = $segStart.Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
-                    ToUtc         = $rows[$i - 1].Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
+                    FromTime      = $segStart.Utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')
+                    ToTime        = $rows[$i - 1].Utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')
                     DurationSec   = [math]::Round(($rows[$i - 1].Utc - $segStart.Utc).TotalSeconds, 1)
                     Records       = $recCount
                 })
@@ -837,14 +843,14 @@ function Invoke-Analyze {
     }
     $null = $segments.Add([pscustomobject]@{
             Node        = $segStart.Node
-            FromUtc     = $segStart.Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
-            ToUtc       = $rows[-1].Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
+            FromTime    = $segStart.Utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')
+            ToTime      = $rows[-1].Utc.ToLocalTime().ToString('yyyy-MM-dd HH:mm:ss.fff')
             DurationSec = [math]::Round(($rows[-1].Utc - $segStart.Utc).TotalSeconds, 1)
             Records     = $recCount
         })
     # 実書込率 = 実レコード数 / 区間長から期待されるレコード数
     $segments |
-        Select-Object Node, FromUtc, ToUtc, Records,
+        Select-Object Node, FromTime, ToTime, Records,
             @{n = 'DurationSec'; e = { $_.DurationSec } },
             @{n = '実書込率'; e = {
                     if ($_.DurationSec -gt 0) {
