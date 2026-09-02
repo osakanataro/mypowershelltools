@@ -1,0 +1,10 @@
+- PowerShell製のスクリプト置き場
+  - HAHeartbeat.ps1
+    - 仮想基盤側のHA機能により、物理サーバを跨いだ仮想マシンの再起動を行う時に、どれくらいの時間帯OSが動いていなかったかを10秒間隔で記録する。
+    - サービスとして起動させるのは非常に面倒なので、スタートアッププログラムとして起動後に自動起動するようにすることができる。
+    - スタートアップへの登録 C:\temp\HAHeartbeat.ps1 -mode install -targetpath c:\temp\output.csv
+    - スタートアップからの解除 C:\temp\HAHeartbeat.ps1 -mode uninstall
+    - プログラムの手動開始 C:\temp\HAHeartbeat.ps1 -mode start
+    - プログラムの手動停止 C:\temp\HAHeartbeat.ps1 -mode stop
+    - 状態の確認 C:\temp\HAHeartbeat.ps1 -mode status -targetpath c:\temp\output.csv
+    - 状況のまとめ C:\temp\HAHeartbeat.ps1 -mode analyze -targetpath c:\temp\output.csv
