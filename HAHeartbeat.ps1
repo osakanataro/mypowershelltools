@@ -282,6 +282,36 @@ function Invoke-RunMode {
     Write-LocalLog -Level 'EVENT' -Message ("SCRIPT START pid={0} target='{1}' interval={2}s timeout={3}s script='{4}'" -f `
             $pid_, $TargetPath, $IntervalSeconds, $AccessTimeoutSeconds, $PSCommandPath)
 
+    # 起動時に出力先の最終行を読み、再起動/フェールオーバーをまたいだ空白時間を測れるようにする
+    $fileLastUtc  = $null
+    $fileLastNode = $null
+    try {
+        if ([System.IO.File]::Exists($TargetPath)) {
+            $tailLine = @(Get-Content -LiteralPath $TargetPath -Tail 1 -Encoding UTF8 -ErrorAction Stop) |
+                        Where-Object { $_ -match '^\d{4}-' } | Select-Object -Last 1
+            if ($tailLine) {
+                $f = $tailLine.Split(',')
+                $fileLastUtc = [datetime]::ParseExact($f[0], 'yyyy-MM-ddTHH:mm:ss.fffZ',
+                    [cultureinfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
+                    [System.Globalization.DateTimeStyles]::AssumeUniversal)
+                $fileLastNode = $f[2]
+                Write-LocalLog -Level 'EVENT' -Message (
+                    "PREVIOUS WRITE 出力先の最終書込: node={0} utc={1} (現在との差={2}s)" -f `
+                        $fileLastNode,
+                        $fileLastUtc.ToString('yyyy-MM-dd HH:mm:ss.fff'),
+                        [math]::Round(([DateTime]::UtcNow - $fileLastUtc).TotalSeconds, 3))
+            }
+        }
+        else {
+            Write-LocalLog -Level 'INFO' -Message '出力先ファイルは未作成です (初回起動)。'
+        }
+    }
+    catch {
+        Write-LocalLog -Level 'INFO' -Message ("出力先の最終書込を取得できませんでした (STANDBY 起動と推定): {0}" -f $_.Exception.Message)
+    }
+
+    $startedUtc      = [DateTime]::UtcNow
     $role            = 'Unknown'
     $seq             = 0
     $standbyCycles   = 0
@@ -320,14 +350,31 @@ function Invoke-RunMode {
             #---------------- Active ----------------
             if ($role -ne 'Active') {
                 $prev = $role
-                $downSec = if ($lastActiveUtc) {
-                    [math]::Round(($utcNow - $lastActiveUtc).TotalSeconds, 3)
-                } else { $null }
-                $heldSec = [math]::Round(($utcNow - $roleSinceUtc).TotalSeconds, 3)
 
-                Write-LocalLog -Level 'EVENT' -Message (
-                    "ROLE CHANGE {0} -> ACTIVE : seq={1} 直前役割の継続={2}s 自ノード無書込期間={3}s" -f `
-                        $prev, $seq, $heldSec, $(if ($null -ne $downSec) { $downSec } else { 'n/a' }))
+                if ($prev -eq 'Unknown') {
+                    # プロセス起動後の初回判定。前プロセス/他ノードの最終書込からの空白時間を出す。
+                    $blank = if ($fileLastUtc) {
+                        '{0}s (直前の書込ノード={1})' -f `
+                            [math]::Round(($utcNow - $fileLastUtc).TotalSeconds, 3), $fileLastNode
+                    } else { 'n/a (出力先に既存レコードなし)' }
+
+                    Write-LocalLog -Level 'EVENT' -Message (
+                        "ROLE DECIDED Unknown -> ACTIVE : seq={0} 起動から判定まで={1}s 出力先の空白時間={2}" -f `
+                            $seq,
+                            [math]::Round(($utcNow - $startedUtc).TotalSeconds, 3),
+                            $blank)
+                }
+                else {
+                    $blank = if ($lastActiveUtc) {
+                        '{0}s' -f [math]::Round(($utcNow - $lastActiveUtc).TotalSeconds, 3)
+                    } else { 'n/a' }
+
+                    Write-LocalLog -Level 'EVENT' -Message (
+                        "ROLE CHANGE {0} -> ACTIVE : seq={1} 直前役割の継続={2}s 自ノード無書込期間={3}" -f `
+                            $prev, $seq,
+                            [math]::Round(($utcNow - $roleSinceUtc).TotalSeconds, 3),
+                            $blank)
+                }
 
                 $role          = 'Active'
                 $roleSinceUtc  = $utcNow
@@ -335,17 +382,24 @@ function Invoke-RunMode {
                 $standbyCycles  = 0
             }
             $lastActiveUtc = $utcNow
+            $fileLastUtc   = $utcNow
+            $fileLastNode  = $env:COMPUTERNAME
         }
         else {
             #---------------- Standby ----------------
             $consecFailures++
             if ($role -ne 'Standby') {
-                $prev = $role
-                $heldSec = [math]::Round(($utcNow - $roleSinceUtc).TotalSeconds, 3)
+                $prev  = $role
+                $label = if ($prev -eq 'Unknown') { 'ROLE DECIDED' } else { 'ROLE CHANGE' }
+                $span  = if ($prev -eq 'Unknown') {
+                    '起動から判定まで={0}s' -f [math]::Round(($utcNow - $startedUtc).TotalSeconds, 3)
+                } else {
+                    '直前役割の継続={0}s' -f [math]::Round(($utcNow - $roleSinceUtc).TotalSeconds, 3)
+                }
 
                 Write-LocalLog -Level 'EVENT' -Message (
-                    "ROLE CHANGE {0} -> STANDBY : seq={1} 直前役割の継続={2}s 理由='{3}'{4}" -f `
-                        $prev, $seq, $heldSec, $res.Error,
+                    "{0} {1} -> STANDBY : seq={2} {3} 理由='{4}'{5}" -f `
+                        $label, $prev, $seq, $span, $res.Error,
                         $(if ($res.TimedOut) { ' (TIMEOUT)' } else { '' }))
 
                 $role         = 'Standby'
