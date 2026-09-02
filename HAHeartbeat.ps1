@@ -234,6 +234,8 @@ function Invoke-TimedWrite {
             $sw = New-Object System.IO.StreamWriter($fs, $enc)
             $sw.WriteLine($l)
             $sw.Flush()
+            # プロセス強制終了時に行が途中で切れないよう OS バッファまで確定させる
+            $fs.Flush($true)
             $sw.Dispose()
         }
         finally {
@@ -650,19 +652,65 @@ function Invoke-Analyze {
         throw "出力ファイルが見つかりません (このノードから共有ディスクが見えていない可能性): $TargetPath"
     }
 
-    $rows = @(Import-Csv -LiteralPath $TargetPath -Encoding UTF8 | ForEach-Object {
-            [pscustomobject]@{
-                Utc      = [datetime]::ParseExact($_.TimestampUtc, 'yyyy-MM-ddTHH:mm:ss.fffZ',
-                            [cultureinfo]::InvariantCulture,
-                            [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor
-                            [System.Globalization.DateTimeStyles]::AssumeUniversal)
-                Local    = $_.TimestampLocal
-                Node     = $_.ComputerName
-                Sequence = [int]$_.Sequence
-                Pid      = $_.ProcessId
-            }
-        })
-    $rows = @($rows | Sort-Object Utc)
+    # 不正行 (プロセス強制終了による書き込み途中の行など) が混在しても
+    # 解析全体を止めず、スキップして件数を報告する。
+    $culture = [cultureinfo]::InvariantCulture
+    $styles  = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor `
+               [System.Globalization.DateTimeStyles]::AssumeUniversal
+    $formats = [string[]]@(
+        'yyyy-MM-ddTHH:mm:ss.fffZ',
+        'yyyy-MM-ddTHH:mm:ss.fff',
+        'yyyy-MM-ddTHH:mm:ssZ',
+        'yyyy-MM-dd HH:mm:ss.fff'
+    )
+
+    $parsed  = New-Object System.Collections.ArrayList
+    $skipped = New-Object System.Collections.ArrayList
+    $lineNo  = 1   # 1 行目はヘッダー
+
+    foreach ($rec in (Import-Csv -LiteralPath $TargetPath -Encoding UTF8)) {
+        $lineNo++
+
+        $tsProp = $rec.PSObject.Properties['TimestampUtc']
+        $ts     = if ($tsProp) { [string]$tsProp.Value } else { $null }
+
+        $dt = [datetime]::MinValue
+        if ([string]::IsNullOrWhiteSpace($ts) -or
+            -not [datetime]::TryParseExact($ts, $formats, $culture, $styles, [ref]$dt)) {
+
+            $null = $skipped.Add([pscustomobject]@{
+                    Line  = $lineNo
+                    Value = if ($ts) { $ts } else { '(空)' }
+                })
+            continue
+        }
+
+        $nodeProp = $rec.PSObject.Properties['ComputerName']
+        $seqProp  = $rec.PSObject.Properties['Sequence']
+        $pidProp  = $rec.PSObject.Properties['ProcessId']
+
+        $seqVal = 0
+        if ($seqProp) { [void][int]::TryParse([string]$seqProp.Value, [ref]$seqVal) }
+
+        $null = $parsed.Add([pscustomobject]@{
+                Utc      = $dt
+                Node     = if ($nodeProp) { [string]$nodeProp.Value } else { '(不明)' }
+                Sequence = $seqVal
+                Pid      = if ($pidProp) { [string]$pidProp.Value } else { '' }
+            })
+    }
+
+    if ($skipped.Count -gt 0) {
+        Write-Host ("解析できない行を {0} 件スキップしました:" -f $skipped.Count) -ForegroundColor Yellow
+        $skipped | Select-Object -First 10 | ForEach-Object {
+            $v = if ($_.Value.Length -gt 90) { $_.Value.Substring(0, 90) + '...' } else { $_.Value }
+            Write-Host ("  {0} 行目: {1}" -f $_.Line, $v) -ForegroundColor DarkYellow
+        }
+        if ($skipped.Count -gt 10) { Write-Host ("  ... 他 {0} 件" -f ($skipped.Count - 10)) -ForegroundColor DarkYellow }
+        Write-Host ""
+    }
+
+    $rows = @($parsed | Sort-Object Utc)
 
     if ($rows.Count -lt 2) {
         Write-Host "解析可能なレコードが不足しています (件数: $($rows.Count))。" -ForegroundColor Yellow
