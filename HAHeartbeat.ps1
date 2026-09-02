@@ -87,6 +87,14 @@ param(
 
     [double]$GapFactor = 1.5,
 
+    # Analyze 用: この秒数を超える断絶は「停止期間 (OUTAGE)」として区別し、
+    # フェールオーバー サマリの集計対象から除外する。0 で無効。
+    [double]$OutageThresholdSeconds = 300,
+
+    # Analyze 用: 解析対象をローカル時刻で絞り込む
+    [datetime]$Since,
+    [datetime]$Until,
+
     # Install 用
     [string]$RunAsUser = 'SYSTEM',
     [string]$RunAsPassword,
@@ -712,6 +720,16 @@ function Invoke-Analyze {
 
     $rows = @($parsed | Sort-Object Utc)
 
+    # 期間フィルタ (ローカル時刻で指定 -> UTC に変換して比較)
+    if ($PSBoundParameters.ContainsKey('Since')) {
+        $sinceUtc = $Since.ToUniversalTime()
+        $rows = @($rows | Where-Object { $_.Utc -ge $sinceUtc })
+    }
+    if ($PSBoundParameters.ContainsKey('Until')) {
+        $untilUtc = $Until.ToUniversalTime()
+        $rows = @($rows | Where-Object { $_.Utc -le $untilUtc })
+    }
+
     if ($rows.Count -lt 2) {
         Write-Host "解析可能なレコードが不足しています (件数: $($rows.Count))。" -ForegroundColor Yellow
         return
@@ -735,18 +753,22 @@ function Invoke-Analyze {
         $nodeChanged = ($prev.Node -ne $cur.Node)
 
         if ($gap -gt $threshold -or $nodeChanged) {
-            $kind = if ($nodeChanged -and $gap -gt $threshold) { 'FAILOVER' }
-                    elseif ($nodeChanged)                      { 'NODE-SWITCH (無断絶)' }
-                    else                                       { 'GAP (同一ノード)' }
+            $isOutage = ($OutageThresholdSeconds -gt 0 -and $gap -gt $OutageThresholdSeconds)
+
+            $kind = if ($isOutage -and $nodeChanged)                 { 'OUTAGE+SW' }
+                    elseif ($isOutage)                               { 'OUTAGE' }
+                    elseif ($nodeChanged -and $gap -gt $threshold)   { 'FAILOVER' }
+                    elseif ($nodeChanged)                            { 'SWITCH' }
+                    else                                             { 'GAP' }
 
             $null = $events.Add([pscustomobject]@{
-                    Type          = $kind
-                    LastWriteUtc  = $prev.Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
-                    LastNode      = $prev.Node
-                    NextWriteUtc  = $cur.Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
-                    NextNode      = $cur.Node
-                    GapSeconds    = [math]::Round($gap, 3)
-                    LostBeats     = [math]::Max(0, [int][math]::Round($gap / $IntervalSeconds) - 1)
+                    Type     = $kind
+                    LastUtc  = $prev.Utc.ToString('MM-dd HH:mm:ss.fff')
+                    LastNode = $prev.Node
+                    NextUtc  = $cur.Utc.ToString('MM-dd HH:mm:ss.fff')
+                    NextNode = $cur.Node
+                    Gap      = [math]::Round($gap, 3)
+                    Lost     = [math]::Max(0, [int][math]::Round($gap / $IntervalSeconds) - 1)
                 })
         }
     }
@@ -755,12 +777,25 @@ function Invoke-Analyze {
         Write-Host "断絶・ノード切り替わりは検出されませんでした。" -ForegroundColor Green
     }
     else {
-        Write-Host "--- 検出イベント ---" -ForegroundColor Yellow
-        $events | Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+        $outages  = @($events | Where-Object { $_.Type -like 'OUTAGE*' })
+        $realtime = @($events | Where-Object { $_.Type -notlike 'OUTAGE*' })
 
-        $failovers = @($events | Where-Object { $_.Type -like 'FAILOVER*' })
+        if ($realtime.Count -gt 0) {
+            Write-Host "--- 検出イベント (稼働中の断絶) ---" -ForegroundColor Yellow
+            $realtime | Format-Table Type, LastUtc, LastNode, NextUtc, NextNode, Gap, Lost `
+                -AutoSize | Out-String -Width 500 | Write-Host
+        }
+
+        if ($outages.Count -gt 0) {
+            Write-Host ("--- 停止期間 ({0} 秒超: サマリ対象外) ---" -f $OutageThresholdSeconds) -ForegroundColor DarkGray
+            $outages | Select-Object Type, LastUtc, NextUtc,
+                @{n = 'Gap'; e = { '{0:N1}s ({1:N1}h)' -f $_.Gap, ($_.Gap / 3600) } } |
+                Format-Table -AutoSize | Out-String -Width 500 | Write-Host
+        }
+
+        $failovers = @($events | Where-Object { $_.Type -eq 'FAILOVER' })
         if ($failovers.Count -gt 0) {
-            $gaps = $failovers | ForEach-Object { $_.GapSeconds }
+            $gaps = $failovers | ForEach-Object { $_.Gap }
             $measured = $gaps | Measure-Object -Average -Maximum -Minimum
             Write-Host "--- フェールオーバー サマリ ---" -ForegroundColor Cyan
             Write-Host ("  発生回数        : {0} 回" -f $failovers.Count)
@@ -771,20 +806,32 @@ function Invoke-Analyze {
             Write-Host ("  ※ 断絶時間には最大 {0} 秒の書込間隔による誤差が含まれます。" -f $IntervalSeconds) -ForegroundColor DarkGray
             Write-Host "     より正確な検知時刻は各ノードのローカルログの ROLE CHANGE 行を参照してください。" -ForegroundColor DarkGray
         }
+        elseif ($realtime.Count -gt 0) {
+            $m = $realtime | ForEach-Object { $_.Gap } | Measure-Object -Average -Maximum
+            Write-Host "--- 稼働中の断絶サマリ (ノード切り替わりなし) ---" -ForegroundColor Cyan
+            Write-Host ("  件数         : {0} 件" -f $realtime.Count)
+            Write-Host ("  最大断絶     : {0} 秒" -f [math]::Round($m.Maximum, 3))
+            Write-Host ("  平均断絶     : {0} 秒" -f [math]::Round($m.Average, 3))
+            Write-Host "  ※ 同一ノード内の断絶はプロセス再起動やディスク遅延が主因です。" -ForegroundColor DarkGray
+        }
     }
 
     Write-Host ""
     Write-Host "--- ノード別 書き込み区間 ---" -ForegroundColor Cyan
     $segments = New-Object System.Collections.ArrayList
     $segStart = $rows[0]
+    $recCount = 1
     for ($i = 1; $i -lt $rows.Count; $i++) {
+        $recCount++
         if ($rows[$i].Node -ne $rows[$i - 1].Node) {
             $null = $segments.Add([pscustomobject]@{
                     Node          = $segStart.Node
                     FromUtc       = $segStart.Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
                     ToUtc         = $rows[$i - 1].Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
                     DurationSec   = [math]::Round(($rows[$i - 1].Utc - $segStart.Utc).TotalSeconds, 1)
+                    Records       = $recCount
                 })
+            $recCount = 0
             $segStart = $rows[$i]
         }
     }
@@ -793,9 +840,20 @@ function Invoke-Analyze {
             FromUtc     = $segStart.Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
             ToUtc       = $rows[-1].Utc.ToString('yyyy-MM-dd HH:mm:ss.fff')
             DurationSec = [math]::Round(($rows[-1].Utc - $segStart.Utc).TotalSeconds, 1)
+            Records     = $recCount
         })
-    $segments | Select-Object Node, FromUtc, ToUtc, DurationSec |
-        Format-Table -AutoSize | Out-String -Width 200 | Write-Host
+    # 実書込率 = 実レコード数 / 区間長から期待されるレコード数
+    $segments |
+        Select-Object Node, FromUtc, ToUtc, Records,
+            @{n = 'DurationSec'; e = { $_.DurationSec } },
+            @{n = '実書込率'; e = {
+                    if ($_.DurationSec -gt 0) {
+                        '{0:N1}%' -f (100 * $_.Records / (($_.DurationSec / $IntervalSeconds) + 1))
+                    } else { 'n/a' }
+                }
+            } |
+        Format-Table -AutoSize | Out-String -Width 500 | Write-Host
+    Write-Host "  ※ DurationSec には停止期間も含まれます。実書込率が低い場合は停止期間があったことを示します。" -ForegroundColor DarkGray
 }
 
 #--------------------------------------------------------------------------
